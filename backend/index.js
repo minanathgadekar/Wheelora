@@ -1,0 +1,2221 @@
+// File: backend/index.js - FINAL VERSION WITH BOOKING VALIDATION
+
+import express from 'express';
+import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
+import 'dotenv/config';
+import jwt from 'jsonwebtoken';
+import Razorpay from "razorpay";
+import crypto from "crypto";
+import PDFDocument from "pdfkit";
+import fs from "fs";
+import FormData from "form-data";
+import fetch from "node-fetch";
+import invoiceRoutes from "./routes/invoice.js";
+
+
+
+// app declared once
+const app = express();
+app.use(cors({ origin: 'http://localhost:5173' })); // Secure CORS
+app.use(express.json());
+// Invoice route moved down after middleware definition
+
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+const WHATSAPP_API_URL = `https://graph.facebook.com/v17.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
+const supabaseAdmin = createClient(supabaseUrl, supabaseKey);
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is not defined in your .env file!");
+}
+
+// ================== AUTH TOKEN MIDDLEWARE ==================
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+
+  try {
+    // 1. Verify with Supabase Auth (works for all signing algorithms: ES256 and HS256)
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (!error && user) {
+      req.user = {
+        sub: user.id,
+        id: user.id,
+        email: user.email,
+        user_metadata: user.user_metadata || {},
+        ...user
+      };
+      req.userToken = token;
+      return next();
+    }
+
+    // 2. Fallback to direct jwt.verify
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    req.userToken = token;
+    next();
+  } catch (err) {
+    res.status(403).json({ error: 'Invalid token' });
+  }
+};
+
+// Route Mounting (Must be after middleware definition)
+app.use("/api/invoice", authenticateToken, invoiceRoutes); // Secure Invoice Route
+//<---new code for rls error >
+function getUserSupabase(req) {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${req.userToken}`,
+      },
+    },
+  });
+}
+
+async function checkAdmin(req) {
+  const userId = req.user?.sub;
+  const metaRole = req.user?.user_metadata?.role;
+  console.log(`🔒 Checking Admin Access for ${userId}`);
+
+  // Removed Metadata Fast Check for Security - Always verify DB
+
+  // Database check (Source of Truth)
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', userId)
+      .single();
+
+    if (error) {
+      console.error("   - ❌ DB Fetch Error:", error.message);
+      return false;
+    }
+
+    console.log(`   - DB Role: ${data?.role}`);
+    req.adminDebug = { userId, metaRole, dbRole: data?.role };
+
+    if (data?.role === 'admin') {
+      console.log("   - ✅ Approved via Database");
+      return true;
+    }
+  } catch (err) {
+    console.error("   - ❌ Admin check exception:", err);
+    req.adminDebug = { userId, metaRole, error: err.message };
+    return false;
+  }
+
+  console.log("   - ⛔ Access Denied");
+  req.adminDebug = { userId, metaRole, dbRole: 'none (fetch failed or mismatch)' };
+  // Check if data existed but role mismatch
+  // We need to move `data` out of try block scope or re-fetch logic slightly?
+  // Actually, inside the try block where we have data:
+  // if (data?.role !== 'admin') req.adminDebug = { userId, metaRole, dbRole: data?.role };
+  return false;
+}
+
+//<--------------- Function to send WhatsApp messages---------->s
+async function sendWhatsAppMessage(to, message, recipientType = "user", filePath, bookingId) {
+
+  console.log("\n============================");
+  console.log(`📩 Preparing WhatsApp for ${recipientType.toUpperCase()}`);
+  console.log(`👉 Recipient number: ${to}`);
+  console.log(`👉 Message content:\n${message}`);
+  console.log("============================\n");
+  if (filePath) console.log(`👉 With attachment: ${filePath}`);
+
+  try {
+    const res = await fetch(WHATSAPP_API_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: to,
+        type: "text",
+        text: { body: message },
+      }),
+    });
+
+    const data = await res.json();
+    // console.log(`📩 WhatsApp API response for ${recipientType}:`, data);
+    if (!res.ok) {
+      console.error(`❌ WhatsApp API error for ${recipientType}:`, data);
+      return false;
+    }
+    // console.log(`✅ WhatsApp sent successfully to ${recipientType}:`, data);
+
+    // 2️⃣ If invoice PDF exists, upload & send
+    if (filePath) {
+      console.log("📂 Uploading PDF from path:", filePath);
+
+      const formData = new FormData();
+      formData.append("file", fs.createReadStream(filePath)); // ✅ only file
+      formData.append("type", "application/pdf"); // ✅ tell WhatsApp it's a document
+      formData.append("messaging_product", "whatsapp");
+
+
+
+      const uploadRes = await fetch(
+        `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/media`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+            ...formData.getHeaders()   // ✅ required for multipart boundary
+          },
+          body: formData,
+        }
+      );
+
+      const uploadData = await uploadRes.json();
+      console.log("📂 Upload response:", JSON.stringify(uploadData, null, 2));
+      if (!uploadRes.ok || !uploadData.id) {
+        console.error("❌ Error uploading invoice:", uploadData);
+        return false;
+      }
+      console.log("✅ Media uploaded with ID:", uploadData.id);
+
+      const docRes = await fetch(WHATSAPP_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to,
+          type: "document",
+          document: {
+            id: uploadData.id,
+            caption: "📄 Your Rental Invoice",
+            filename: `invoice-${bookingId || Date.now()}.pdf`,
+          },
+        }),
+      });
+      const docData = await docRes.json();
+      console.log("📤 Document send response:", JSON.stringify(docData, null, 2));
+      // console.log("📤 Upload response:", uploadData);
+      console.log("📩 Document message response:", docData);
+      if (!docRes.ok) {
+        console.error("❌ Error sending PDF:", docData);
+        return false;
+      }
+      console.log("✅ PDF invoice sent successfully!");
+    }
+
+    console.log(`✅ WhatsApp sent successfully to ${recipientType}`);
+    return true;
+  } catch (err) {
+    console.error(`❌ WhatsApp error for ${recipientType}:`, err);
+    return false;
+  }
+
+}
+
+async function notifyBooking(userData, hostData, vehicle, booking, invoicePath) {
+  try {
+    // Generate hybrid invoice number: INV-YYYY-XXXX
+    // const year = new Date().getFullYear();
+    let invoiceNumber = booking.invoice_no;
+
+    // Extract only the date part
+    const startDate = booking.start_date.split("T")[0];
+    const endDate = booking.end_date.split("T")[0];
+
+    // WhatsApp message to user
+    const userMessage = `✅ Booking Confirmed!
+Invoice No: ${invoiceNumber}
+Vehicle: ${vehicle.make} ${vehicle.model}
+From: ${startDate} To: ${endDate}
+Amount: ₹${booking.total_price}`;
+
+    const hostMessage = `📢 New Booking!
+ Customer: ${userData.full_name} 
+ Vehicle: ${vehicle.make} ${vehicle.model} 
+ From: ${startDate} To: ${endDate};`;
+
+
+    // Send WhatsApp message to user only
+    await sendWhatsAppMessage(
+      userData.phone_primary,
+      userMessage,
+      "user",
+      invoicePath,
+      invoiceNumber
+    );
+
+    await sendWhatsAppMessage(
+      hostData.phone_primary,
+      hostMessage,
+      "host" // 🚫 no invoice attached for host
+    );
+
+
+
+
+    console.log("✅ WhatsApp notification sent to user with hybrid invoice number");
+
+    // Delete invoice after sending
+    fs.unlink(invoicePath, (err) => {
+      if (err) console.error("❌ Error deleting invoice:", err);
+      else console.log("🗑️ Deleted invoice file:", invoicePath);
+    });
+
+  } catch (err) {
+    console.error("❌ WhatsApp notify failed:", err);
+  }
+}
+
+
+// <--------------- Function to generate invoice PDF  ----------->
+
+async function generateInvoice(booking, userData, hostData, vehicle) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // ---------------- Generate hybrid invoice number ----------------
+      let invoiceNo = booking.invoice_no;
+      if (!invoiceNo) {
+        // Fetch last booking with invoice_no like INV-YYYY-XXXX
+        const { data: lastBooking } = await supabase
+          .from("bookings")
+          .select("invoice_no")
+          .like("invoice_no", `INV-${new Date().getFullYear()}-%`)
+          .order("invoice_no", { ascending: false })
+          .limit(1)
+          .single();
+
+        if (!lastBooking?.invoice_no) {
+          invoiceNo = `INV-${new Date().getFullYear()}-0001`;
+        } else {
+          const lastNumber = parseInt(lastBooking.invoice_no.split("-")[2]);
+          const newNumber = String(lastNumber + 1).padStart(4, "0");
+          invoiceNo = `INV-${new Date().getFullYear()}-${newNumber}`;
+        }
+
+        // Save the new invoice number back to booking
+        const { error: invoiceUpdateError } = await supabase
+          .from("bookings")
+          .update({ invoice_no: invoiceNo })
+          .eq("id", booking.id);
+
+        if (invoiceUpdateError) console.error("❌ Failed to save invoice_no:", invoiceUpdateError);
+      }
+
+      const invoicePath = `./invoices/invoice-${invoiceNo}.pdf`;
+
+
+      // Ensure invoices folder exists
+      if (!fs.existsSync("./invoices")) fs.mkdirSync("./invoices");
+
+      const doc = new PDFDocument({ margin: 50 });
+      const stream = fs.createWriteStream(invoicePath);
+      doc.pipe(stream);
+
+      // ===== HEADER =====
+      doc.fontSize(20).font("Helvetica-Bold").text("Wheelora", { align: "center" });
+      doc.moveDown(0.5);
+      doc.fontSize(12).font("Helvetica").text("Official Vehicle Rental Marketplace", { align: "center" });
+      doc.moveDown(1);
+      doc.moveTo(50, doc.y).lineTo(550, doc.y).stroke();
+      doc.moveDown(1);
+
+      // ===== INVOICE TITLE =====
+      doc.fontSize(16).font("Helvetica-Bold").text("INVOICE", { align: "center" });
+      doc.moveDown(1);
+
+      // ===== Invoice Info =====
+      doc.fontSize(12).font("Helvetica");
+      doc.text(`Invoice No: ${invoiceNo}`);
+      doc.text(`Date: ${new Date().toLocaleDateString()}`);
+      doc.moveDown(1);
+
+      // ===== BILL TO =====
+      doc.fontSize(14).font("Helvetica-Bold").text("Billed To:");
+      doc.fontSize(12).font("Helvetica");
+      doc.text(`${userData.full_name}`);
+      doc.text(`Phone: ${userData.phone_primary}`);
+      doc.moveDown(1);
+
+      // ===== HOST =====
+      doc.fontSize(14).font("Helvetica-Bold").text("Host:");
+      doc.fontSize(12).font("Helvetica");
+      doc.text(`${hostData.full_name}`);
+      doc.text(`Phone: ${hostData.phone_primary}`);
+      doc.moveDown(1);
+
+      // ===== BOOKING SUMMARY (Table Style) =====
+      doc.fontSize(14).font("Helvetica-Bold").text("Booking Summary");
+      doc.moveDown(0.5);
+
+      const tableTop = doc.y;
+      const itemX = 50, fromX = 200, toX = 300, amountX = 450;
+
+      doc.fontSize(12).font("Helvetica-Bold");
+      doc.text("Vehicle", itemX, tableTop);
+      doc.text("From", fromX, tableTop);
+      doc.text("To", toX, tableTop);
+      doc.text("Amount (₹)", amountX, tableTop);
+
+      doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+      doc.font("Helvetica").fontSize(12);
+      doc.text(`${vehicle.make} ${vehicle.model}`, itemX, tableTop + 25);
+      doc.text(`${booking.start_date.split("T")[0]}`, fromX, tableTop + 25);
+      doc.text(`${booking.end_date.split("T")[0]}`, toX, tableTop + 25);
+      doc.text(`${booking.total_price}`, amountX, tableTop + 25);
+
+      doc.moveTo(50, tableTop + 60).lineTo(550, tableTop + 60).stroke();
+      doc.font("Helvetica-Bold").text("TOTAL:", toX, tableTop + 70);
+      doc.text(`₹${booking.total_price}`, amountX, tableTop + 70);
+
+      doc.moveDown(3);
+
+      // ===== FOOTER =====
+      doc.fontSize(10).font("Helvetica-Oblique").fillColor("gray");
+      doc.text(
+        "This invoice is system generated by Wheelora.\n" +
+        "We act as a marketplace connecting renters and hosts.\n" +
+        "Please contact the host for vehicle-related issues.",
+        { align: "center" }
+      );
+      doc.end();
+
+      stream.on("finish", async () => { //// creates and saves invoice url to supabase 
+        try {
+          const fileBuffer = fs.readFileSync(invoicePath);
+          const fileName = `invoice-${invoiceNo}.pdf`;
+
+          const { data, error } = await supabase.storage
+            .from("invoices")
+            .upload(fileName, fileBuffer, {
+              contentType: "application/pdf",
+              upsert: true, // allows overwrite
+            });
+
+          if (error) {
+            console.error("❌ Error uploading invoice to Supabase:", error);
+            return reject(error);
+          }
+
+
+
+          resolve({ invoiceNo, invoicePath });
+        } catch (uploadErr) {
+          reject(uploadErr);
+        }
+      });
+      stream.on("error", reject);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+
+
+//<---------------------whatsapp function ends here ----------------->
+
+// --- API Endpoints ---
+
+// ======== AUTHENTICATION ENDPOINTS ========
+
+/*  use for login/signup style 
+// User Signup
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    // UPDATED: Now reads the 'role' from the request body
+    const { email, password, full_name, role } = req.body;
+
+    // A small security check to ensure the role is valid
+    const userRole = (role === 'host' || role === 'tourist') ? role : 'tourist';
+
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          full_name,
+          role: userRole, // UPDATED: Uses the role sent from the frontend
+        }
+      }
+    });
+
+    if (error) throw error;
+
+    res.status(201).json({ message: `User created successfully as a ${userRole}.`, user: data.user });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Step 1: Authenticate the user with Supabase Auth
+    const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (loginError) throw loginError;
+
+    // Step 2: Fetch the user's profile to get our custom role
+    const { data: profileData, error: profileError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', loginData.user.id)
+      .single();
+
+    if (profileError) throw profileError;
+
+    // Step 3: Combine the session (with token) and the profile data for the response
+    const response = {
+      session: loginData.session,
+      profile: profileData
+    };
+
+    res.status(200).json(response);
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET the profile of the currently logged-in user
+app.get('/api/users/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Profile not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+*/
+
+
+
+
+// ---------------- GET CURRENT USER PROFILE ----------------
+// ---------------- GET CURRENT USER PROFILE (With Lazy Sync) ----------------
+app.get("/api/users/me", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+
+    // 1. Try to fetch profile from public table
+    let { data, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", userId)
+      .limit(1);
+
+    // 2. CHECK if profile is missing OR incomplete (missing name)
+    // This fixes "Valued Member" issue where row exists but name is null
+    const profileExists = data && data.length > 0;
+    const isProfileIncomplete = profileExists && !data[0].full_name;
+
+    if (!profileExists || isProfileIncomplete) {
+      console.log(`⚠️ Profile issue for ${userId} (Missing: ${!profileExists}, Incomplete: ${isProfileIncomplete}). Syncing from Auth...`);
+
+      try {
+        // Fetch Auth Metadata using Admin Client
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.getUserById(userId);
+
+        if (authError || !authData.user) {
+          console.error("❌ Could not fetch user from Auth:", authError);
+          // If we have an incomplete profile, return it at least. If nothing, 404.
+          if (profileExists) return res.status(200).json(data[0]);
+          return res.status(404).json({ error: "User identity not found." });
+        }
+
+        const userMeta = authData.user.user_metadata || {};
+        const fullNameFromAuth = userMeta.full_name || '';
+
+        if (profileExists) {
+          // UPDATE existing profile
+          console.log(`🛠️ Repairing incomplete profile for ${authData.user.email}...`);
+          const { data: updatedData, error: updateError } = await supabaseAdmin
+            .from('profiles')
+            .update({ full_name: fullNameFromAuth, email: authData.user.email }) // Update email too just in case
+            .eq('id', userId)
+            .select('*');
+
+          if (!updateError && updatedData && updatedData.length > 0) {
+            data = updatedData;
+            console.log("✅ Profile repaired.");
+          }
+        } else {
+          // INSERT new profile
+          const newProfile = {
+            id: userId,
+            full_name: fullNameFromAuth,
+            email: authData.user.email,
+            role: userMeta.role || 'tourist',
+            created_at: new Date().toISOString()
+          };
+
+          const { data: insertData, error: insertError } = await supabaseAdmin
+            .from('profiles')
+            .insert([newProfile])
+            .select('*');
+
+          if (!insertError && insertData && insertData.length > 0) {
+            data = insertData;
+            console.log("✅ Profile lazily created.");
+          }
+        }
+
+      } catch (syncErr) {
+        console.error("Sync error:", syncErr);
+        // Fallthrough to return whatever partial data we might have
+      }
+    } else if (error) {
+      throw error;
+    }
+
+    if (!data || data.length === 0) return res.status(404).json({ error: "Profile not found." });
+
+    res.status(200).json(data[0]);
+  } catch (error) {
+    console.error("GET /me error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// ... existing code ...
+// --- 1. UPDATE the existing user profile update endpoint ---
+// Find: app.put('/api/users/me', ...)
+// Add 'license_document_url' to the list of fields that can be updated.
+
+app.put('/api/users/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { full_name, address, phone_primary, phone_secondary, license_document_url, business_document_url } = req.body;
+
+    const updates = {};
+    if (full_name !== undefined) updates.full_name = full_name;
+    if (address !== undefined) updates.address = address;
+    if (phone_primary !== undefined) updates.phone_primary = phone_primary;
+    if (phone_secondary !== undefined) updates.phone_secondary = phone_secondary;
+    if (license_document_url !== undefined) {
+      updates.license_document_url = license_document_url;
+      // Reset license verification status when a new document is uploaded
+      updates.is_license_verified = false;
+    }
+    if (business_document_url !== undefined) {
+      updates.business_document_url = business_document_url;
+      // Reset host verification status when a new document is uploaded
+      updates.is_verified = false;
+    }
+
+    // Add missing timestamp for updates
+    updates.updated_at = new Date().toISOString();
+
+    console.log("📝 Handling Profile Update for:", userId);
+
+    // 1. Try STANDARD UPDATE first
+    // Using select() here returns an ARRAY. We avoid .single() to prevent "Cannot coerce" errors.
+    const { data: updatedData, error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update(updates)
+      .eq('id', userId)
+      .select('*');
+
+    if (updateError) {
+      console.error("❌ Update failed:", updateError);
+      throw updateError;
+    }
+
+    // 2. SUCCESS: Profile existed and was updated
+    if (updatedData && updatedData.length > 0) {
+      console.log("✅ Profile updated successfully.");
+      return res.status(200).json(updatedData[0]);
+    }
+
+    // 3. FALLBACK: Profile did NOT exist (Lazy Creation on Save)
+    console.log("⚠️ Profile not found during update. Creating new profile...");
+
+    // Fetch Auth Metadata to populate required fields (email, role)
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.getUserById(userId);
+
+    if (authError || !authData.user) {
+      throw new Error("User identity not found in Auth system. Cannot create profile.");
+    }
+
+    const userMeta = authData.user.user_metadata || {};
+
+    // Merge Auth data with the User's requested updates
+    const newProfile = {
+      id: userId,
+      email: authData.user.email,
+      role: userMeta.role || 'tourist',
+      created_at: new Date().toISOString(),
+      ...updates // Spread the updates (name, address, etc.) on top
+    };
+
+    // Insert the new profile
+    const { data: insertData, error: insertError } = await supabaseAdmin
+      .from('profiles')
+      .insert([newProfile])
+      .select('*');
+
+    if (insertError) {
+      console.error("❌ Failed to create missing profile during update:", insertError);
+      throw insertError;
+    }
+
+    if (!insertData || insertData.length === 0) {
+      throw new Error("Insert succeeded but returned no data.");
+    }
+
+    console.log("✅ Created and updated profile simultaneously.");
+    res.status(200).json(insertData[0]);
+
+  } catch (error) {
+    console.error("🔥 EXCEPTION in PUT /api/users/me:", error);
+    // Ensure we send a proper JSON error so the frontend alerts it clearly
+    res.status(500).json({ error: error.message || "Server Error" });
+  }
+});
+// ... existing code ...
+
+// ======== VEHICLE ENDPOINTS ========
+
+// GET all vehicles from the live database - UPDATED
+app.get('/api/vehicles', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('vehicles')
+      // FIXED: Join with profiles table to get the host's full_name
+      .select(`*, profiles ( full_name )`);
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET a single vehicle by its ID from the live database - UPDATED
+app.get('/api/vehicles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('vehicles')
+      // FIXED: Join with profiles for host name AND for reviewer names
+      .select(`
+          *,
+          profiles ( full_name ),
+          reviews ( *, profiles ( full_name ) )
+      `)
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: Endpoint to get booked dates for a vehicle
+app.get('/api/vehicles/:id/booked-dates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('start_date, end_date')
+      .eq('vehicle_id', id)
+      .eq('status', 'confirmed');
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// CREATE a new vehicle (Protected, for hosts only)
+app.post('/api/vehicles', authenticateToken, async (req, res) => {
+  try {
+    let role = req.user?.user_metadata?.role;
+    const hostId = req.user?.sub || req.user?.id;
+    if (role !== 'host') {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', hostId)
+        .single();
+      if (prof?.role) role = prof.role;
+    }
+    if (role !== 'host') {
+      return res.status(403).json({ error: 'Only hosts can create vehicles. Please log in with a host account.' });
+    }
+    const vehicleToInsert = {
+      host_id: hostId,
+      ...req.body
+    };
+    const { data, error } = await supabase
+      .from('vehicles')
+      .insert([vehicleToInsert])
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// UPDATE a vehicle
+app.put('/api/vehicles/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // --- CORRECTED LOGIC ---
+    // Always reset status to 'pending' on any update by a host.
+    // This ensures all changes are re-verified by an admin.
+    updates.status = 'pending';
+    updates.is_certified = false;
+    // --- END CORRECTION ---
+
+    const { data, error } = await supabase
+      .from('vehicles')
+      .update(updates)
+      .eq('id', id)
+      .eq('host_id', req.user.sub) // Ensure only the owner can edit
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Vehicle not found or you do not have permission to update it.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// DELETE a vehicle (Protected, for owner only)
+app.delete('/api/vehicles/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('vehicles')
+      .delete()
+      .eq('id', id)
+      .eq('host_id', req.user.sub)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Vehicle not found or you do not have permission to delete it.' });
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: GET a user's public profile by their ID
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('full_name, role, is_verified, phone_primary, phone_secondary, address') // Only select public, safe data
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: GET all approved vehicles for a specific host
+app.get('/api/hosts/:id/vehicles', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('vehicles')
+      .select('*')
+      .eq('host_id', id)
+      .eq('status', 'approved');
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ======== BOOKING ENDPOINTS (Protected) ========
+
+/// backend/index.js
+
+// CREATE a new booking - UPDATED WITH CORRECT VALIDATION
+app.post('/api/bookings/create-order', authenticateToken, async (req, res) => {
+  try {
+    // DEBUG: Using supabaseAdmin (Service Role) to bypass RLS for now to isolate the issue.
+    // const supabase = getUserSupabase(req); 
+    const supabaseContext = supabaseAdmin;
+
+    const { vehicle_id, start_date, end_date, total_price, dropoff_location } = req.body;
+    console.log("Creating booking for:", { vehicle_id, start_date, end_date, total_price, user_id: req.user.sub });
+
+    if (!vehicle_id || !start_date || !end_date || !total_price) {
+      return res.status(400).json({ error: 'Missing required booking information.' });
+    }
+
+    // --- Overlap check ---
+    const { data: overlappingBookings, error: overlapError } = await supabaseContext
+      .from('bookings')
+      .select('id')
+      .eq('vehicle_id', vehicle_id)
+      .eq('status', 'confirmed')
+      .lte('start_date', end_date)
+      .gte('end_date', start_date);
+
+    if (overlapError) {
+      console.error("Overlap Check Error:", overlapError);
+      throw overlapError;
+    }
+
+    if (overlappingBookings && overlappingBookings.length > 0) {
+      return res.status(409).json({ error: 'This vehicle is already booked for the selected dates. Please choose a different date range.' });
+    }
+
+    // --- Insert Booking ---
+    const bookingData = {
+      user_id: req.user.sub,
+      vehicle_id,
+      start_date,
+      end_date,
+      total_price,
+      status: 'pending',
+      // dropoff_location: dropoff_location || null 
+    };
+
+    console.log("Inserting booking data:", bookingData);
+    const { data: booking, error: bookingError } = await supabaseContext
+      .from('bookings')
+      .insert([bookingData])
+      .select()
+      .single();
+
+    if (bookingError) {
+      console.error("Booking Insert Error:", bookingError);
+      throw bookingError;
+    }
+    console.log("Booking created:", booking.id);
+
+    // 2 Create Razorpay order
+    console.log("Creating Razorpay order...");
+    const order = await razorpay.orders.create({
+      amount: Math.round(total_price * 100), // INR in paise
+      currency: "INR",
+      receipt: booking.id,
+    });
+    console.log("Razorpay order created:", order.id);
+
+    // 3 Insert payment record (pending)
+    const { error: paymentError } = await supabaseContext
+      .from("payments")
+      .insert(
+        {
+          booking_id: booking.id,
+          amount: total_price,
+          currency: "INR",
+          status: "pending",
+          payment_gateway: "razorpay",
+          razorpay_order_id: order.id,
+          user_id: req.user.sub,
+        },
+        { returning: "minimal" }
+      );
+
+    if (paymentError) {
+      console.error("Payment Insert Error:", paymentError);
+      throw paymentError;
+    }
+
+    res.json({ booking, order });
+  } catch (err) {
+    console.error("CRITICAL Error creating booking order:", err);
+    // Serialize the error to ensure we see it in the frontend alert
+    const errorMsg = err.message || JSON.stringify(err) || "Unknown Error";
+    res.status(500).json({
+      error: `Server Error: ${errorMsg}`,
+      details: err
+    });
+  }
+
+});
+
+
+// --- Verify Payment ---
+app.post("/api/payments/verify", async (req, res) => {
+
+  try {
+    // console.log("🔎 Full request body:", req.body);
+    const { bookingId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    // Debug log request
+    /* console.log("Verify API called with:", {
+       bookingId,
+       razorpay_order_id,
+       razorpay_payment_id,
+       razorpay_signature,
+     });   */
+
+    //  Verify signature
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
+
+    //console.log("Expected Signature:", expectedSignature);
+    // console.log("Received Signature:", razorpay_signature);
+
+    if (expectedSignature !== razorpay_signature) {
+      console.error("❌ Signature mismatch!");
+      return res.status(400).json({ error: "Invalid signature" });
+    }
+
+    // Update payment row by booking_id
+    const { data: updatedPayment, error: paymentUpdateError } = await supabase
+      .from("payments")
+      .update({
+        razorpay_payment_id,
+        razorpay_order_id, // optional: re-save for reference
+        status: "paid",
+      })
+      .eq("booking_id", bookingId)
+      .select();
+
+    if (paymentUpdateError) {
+      console.error("❌ Payment update error:", paymentUpdateError);
+      return res.status(500).json({ error: "Failed to update payment" });
+    }
+
+    // console.log("✅ Payment updated:", updatedPayment);
+
+    //  Update booking status
+    const { data: updatedBooking, error: bookingUpdateError } = await supabase
+      .from("bookings")
+      .update({ status: "confirmed" })
+      .eq("id", bookingId)
+      .select();
+
+    if (bookingUpdateError) {
+      console.error("❌ Booking update error:", bookingUpdateError);
+      return res.status(500).json({ error: "Failed to update booking" });
+    }
+
+    //console.log("✅ Booking updated:", updatedBooking);
+
+    // ✅ Fetch booking with user + host details
+    //  console.log("🔎 Booking ID received in verify API:", bookingId);
+
+    const { data: booking, error } = await supabase
+      .from("bookings")
+      .select(`
+    *,
+    vehicles (
+      *,
+      profiles (*)
+    ),
+    profiles (*)
+  `)
+      .eq("id", bookingId)
+      .single();
+
+    //  console.log("📌 Booking data fetched:", JSON.stringify(booking, null, 2));
+
+    if (error) {
+      console.error("❌ Supabase error while fetching booking:", error);
+      return res.status(500).json({ success: false, message: "Error fetching booking" });
+    }
+
+    if (!booking) {
+      console.error("❌ No booking found in DB for bookingId:", bookingId);
+      return res.status(404).json({ success: false, message: "Booking not found in DB" });
+
+    }
+
+
+    const vehicle = booking.vehicles;
+    const userPhone = booking?.profiles?.phone_primary;
+    const hostPhone = booking?.vehicles?.profiles?.phone_primary;
+    const userProfile = booking.profiles;
+    const hostProfile = booking.vehicles?.profiles;
+
+    // console.log("📌 User phone:", userPhone);
+    // console.log("📌 Host phone:", hostPhone);
+
+    // ✅ Send WhatsApp confirmation
+    // ✅ Send WhatsApp notifications
+
+    // ✅ Generate invoice PDF first
+    const { invoiceNo, invoicePath } = await generateInvoice(booking, userProfile, hostProfile, vehicle);
+    // ✅ Send WhatsApp notifications
+    await notifyBooking(userProfile, hostProfile, vehicle, { ...booking, invoice_no: invoiceNo }, invoicePath);
+
+    return res.json({ success: true, message: "Payment verified + WhatsApp sent" });
+  } catch (err) {
+    console.error("❌ verifyPayment error:", err);
+    return res.status(500).json({ success: false, message: "Internal error" });
+  }
+});
+
+
+//<----------- payment failure endpoint --------------->
+
+app.post("/api/payments/fail", async (req, res) => {
+  try {
+    const { booking_id, razorpay_order_id } = req.body;
+    // console.log("⚠️ Payment failure called with:", { booking_id, razorpay_order_id });
+
+    // Update payments table
+    const { data: failedPayment, error: paymentFailError } = await supabase
+      .from("payments")
+      .update({ status: "failed" })
+      .eq("razorpay_order_id", razorpay_order_id)
+      .select();
+
+    if (paymentFailError) {
+      console.error("❌ Failed to update payments:", paymentFailError);
+      return res.status(500).json({ error: "Payment update failed" });
+    }
+    // console.log("✅ Payment marked as failed:", failedPayment);
+
+    // Update booking table
+    const { data: cancelledBooking, error: bookingFailError } = await supabase
+      .from("bookings")
+      .update({ status: "cancelled" })
+      .eq("id", booking_id)
+      .select();
+
+    if (bookingFailError) {
+      console.error("❌ Failed to update booking:", bookingFailError);
+      return res.status(500).json({ error: "Booking update failed" });
+    }
+    // console.log("✅ Booking cancelled:", cancelledBooking);
+
+    res.json({ success: true, msg: "Payment failed & booking cancelled" });
+  } catch (err) {
+    console.error("🔥 Error in fail route:", err);
+    res.status(500).json({ success: false, msg: "Error updating failed payment" });
+  }
+});
+
+// DELETE a specific booking (History Clean-up)
+app.delete('/api/bookings/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Manual Cascade: Delete reviews first
+    const { error: reviewError } = await supabase
+      .from('reviews')
+      .delete()
+      .eq('booking_id', id);
+
+    if (reviewError) console.error("Error deleting reviews for booking:", reviewError);
+
+    const { error } = await supabase
+      .from('bookings')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', req.user.sub); // Security: Only owner can delete
+
+    if (error) throw error;
+    res.json({ success: true, message: "Booking deleted" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+//<--------------- end of booking -------------------------------------------------------->
+
+// READ all of the current user's bookings
+app.get('/api/bookings/my-bookings', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select(`
+          *,
+          reviews(*),
+          vehicles (*)
+        `)
+      .eq('user_id', req.user.sub);
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Cancel Booking + Refund ---
+// PATCH Cancel Booking
+app.patch('/api/bookings/:id/cancel', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1. Fetch booking (Simple Guest Check)
+    const { data: booking, error: bookingError } = await supabase
+      .from("bookings")
+      .select("*, payments(*)")
+      .eq("id", id)
+      .eq("user_id", req.user.sub) // Strictly check if current user is the booker
+      .single();
+
+    if (bookingError || !booking) {
+      return res.status(404).json({ error: "Booking not found or unauthorized" });
+    }
+
+    if (booking.status === "cancelled") {
+      return res.status(400).json({ error: "Booking already cancelled" });
+    }
+
+    // 2. Calculate Refund
+    const now = new Date();
+    const startTime = new Date(booking.start_date);
+    const { requestRefund = true } = req.body;
+
+    let refundPercent = 0;
+    if (requestRefund) {
+      if (now <= startTime) {
+        refundPercent = 1.0; // Before pickup
+      } else {
+        refundPercent = 0.5; // After pickup
+      }
+    } else {
+      refundPercent = 0; // User said "No"
+    }
+
+    const refundAmount = Math.floor(booking.total_price * refundPercent);
+
+    // 3. Cancel Booking
+    const { error: cancelError } = await supabase.from("bookings").update({ status: "cancelled" }).eq("id", id);
+    if (cancelError) throw cancelError;
+
+    // 4. Handle "No Refund" Case
+    if (refundAmount === 0) {
+      // Try to update payment status, but don't fail if it missing/fails
+      try {
+        if (booking.payments && booking.payments.length > 0) {
+          await supabase.from("payments")
+            .update({
+              refund_status: "failed",
+              refund_reason: "User declined refund"
+            })
+            .eq("booking_id", id);
+        }
+      } catch (ignore) { console.error("Payment update skipped:", ignore); }
+
+      return res.json({ success: true, message: "Booking cancelled (No refund)" });
+    }
+
+    // 5. Handle "Yes Refund" Case (Razorpay)
+    const payment = booking.payments?.[0];
+    if (!payment || !payment.razorpay_payment_id) {
+      return res.status(400).json({ error: "Payment record not found for refund" });
+    }
+
+    // Call Razorpay
+    const response = await fetch(
+      `https://api.razorpay.com/v1/payments/${payment.razorpay_payment_id}/refund`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Basic " + Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString("base64"),
+        },
+        body: JSON.stringify({ amount: refundAmount * 100 }), // Amount in paise
+      }
+    );
+
+    const refundData = await response.json();
+
+    if (refundData.error) {
+      throw new Error(refundData.error.description || "Razorpay Refund Failed");
+    }
+
+    // Update Payment to 'initiated'
+    await supabase.from("payments").update({
+      refund_status: "initiated",
+      refund_amount: refundAmount,
+      refund_id: refundData.id,
+      initiated_at: new Date().toISOString(),
+    }).eq("booking_id", id);
+
+    return res.json({
+      success: true,
+      message: `Booking cancelled, refund of ₹${refundAmount} initiated`,
+      refund: { status: "initiated", ...refundData }
+    });
+
+  } catch (error) {
+    console.error("❌ Cancel API error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+/*app.post("/api/bookings/:id/refund-processed", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await supabase.from("payments").update({
+      refund_status: "processed",
+      refunded_at: new Date().toISOString(),
+    }).eq("booking_id", id);
+
+    res.json({ success: true, message: "Refund marked as processed" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update refund status" });
+  }
+});
+// POST /api/bookings/:id/refund-completed
+app.post("/api/bookings/:id/refund-completed", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Update payment as completed
+    await supabase.from("payments").update({
+      refund_status: "completed",
+      refunded_at: new Date().toISOString(), // timestamp for completion
+    }).eq("booking_id", id);
+
+    res.json({ success: true, message: "Refund marked as completed" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update refund status" });
+  }
+});
+*/
+app.get('/api/booking/:id', async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from('bookings')
+    .select(`*, vehicles(*), profiles(*), payments(*)`)
+    .eq('id', id)
+    .single();
+
+
+  if (error) return res.status(404).json({ error: "Booking not found" });
+  res.json(data);
+});
+
+// ------------------ Razorpay Webhook for refund status ------------------
+
+app.post("/api/webhooks/razorpay", async (req, res) => {
+  try {
+    const payload = JSON.stringify(req.body);
+    const signature = req.headers["x-razorpay-signature"];
+
+    // Verify webhook signature
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_WEBHOOK_SECRET)
+      .update(payload)
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      console.error("❌ Invalid webhook signature");
+      return res.status(400).json({ error: "Invalid signature" });
+    }
+
+    const event = req.body.event;
+    const entity = req.body.payload?.refund?.entity;
+
+    if (!entity) {
+      console.warn("⚠️ No refund entity in webhook payload");
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    const refundId = entity.id;
+    const paymentId = entity.payment_id;
+    const refundStatus = entity.status; // created | processed | failed
+    const refundAmount = entity.amount / 100; // convert paise → ₹
+    const refundReason = entity.notes?.reason || "N/A";
+    const refundTime = entity.created_at
+      ? new Date(entity.created_at * 1000).toISOString()
+      : new Date().toISOString();
+
+    console.log(`🔔 Razorpay webhook: ${event} for ${refundId} (${refundStatus})`);
+
+    // ---------------- Update payments table ----------------
+    const { error } = await supabase
+      .from("payments")
+      .update({
+        refund_status: refundStatus,
+        refund_id: refundId,
+        refund_amount: refundAmount,
+        refund_reason: refundReason,
+        refunded_at: refundTime,
+      })
+      .eq("razorpay_payment_id", paymentId);
+
+    if (error) {
+      console.error("❌ Supabase update failed:", error);
+      return res.status(500).json({ error: "Failed to update Supabase" });
+    }
+
+    console.log(`✅ Refund ${refundId} updated → ${refundStatus}`);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("❌ Webhook error:", err);
+    return res.status(500).json({ error: "Webhook handler failed" });
+  }
+});
+
+// ------------------ Razorpay Webhook for refund status ------------------
+
+app.post("/api/webhooks/razorpay", async (req, res) => {
+  try {
+    const payload = JSON.stringify(req.body);
+    const signature = req.headers["x-razorpay-signature"];
+
+    // Verify webhook signature
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_WEBHOOK_SECRET)
+      .update(payload)
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      console.error("❌ Invalid webhook signature");
+      return res.status(400).json({ error: "Invalid signature" });
+    }
+
+    const event = req.body.event;
+    const entity = req.body.payload?.refund?.entity;
+
+    if (!entity) {
+      console.warn("⚠️ No refund entity in webhook payload");
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    const refundId = entity.id;
+    const paymentId = entity.payment_id;
+    const refundStatus = entity.status; // created | processed | failed
+    const refundAmount = entity.amount / 100; // convert paise → ₹
+    const refundReason = entity.notes?.reason || "N/A";
+    const refundTime = entity.created_at
+      ? new Date(entity.created_at * 1000).toISOString()
+      : new Date().toISOString();
+
+    console.log(`🔔 Razorpay webhook: ${event} for ${refundId} (${refundStatus})`);
+
+    // ---------------- Update payments table ----------------
+    const { error } = await supabase
+      .from("payments")
+      .update({
+        refund_status: refundStatus,
+        refund_id: refundId,
+        refund_amount: refundAmount,
+        refund_reason: refundReason,
+        refunded_at: refundTime,
+      })
+      .eq("razorpay_payment_id", paymentId);
+
+    if (error) {
+      console.error("❌ Supabase update failed:", error);
+      return res.status(500).json({ error: "Failed to update Supabase" });
+    }
+
+    console.log(`✅ Refund ${refundId} updated → ${refundStatus}`);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("❌ Webhook error:", err);
+    return res.status(500).json({ error: "Webhook handler failed" });
+  }
+});
+
+// DEV:/api/webhooks/razorpay-simulate
+app.post("/api/webhooks/razorpay-simulate", async (req, res) => {
+  // Only allow in development or specific environment?
+  // For now, allow it as it's a requested feature for loop closing.
+  try {
+    const { refundId, paymentId, status } = req.body;
+    console.log(`🧪 SIMULATING Refund Update: ${refundId} -> ${status}`);
+
+    const { error } = await supabase
+      .from("payments")
+      .update({
+        refund_status: status,
+        refunded_at: new Date().toISOString(),
+      })
+      .eq("razorpay_payment_id", paymentId);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: "Simulated" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Sim fail" });
+  }
+});
+
+// ======== ADMIN ENDPOINTS (Protected) ========
+
+// GET a list of all users
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // 2. Fetch all profiles from the database
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*');
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET all vehicles pending approval
+app.get('/api/admin/vehicles/pending', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: `Access denied. Admin role required. Debug: ${JSON.stringify(req.adminDebug)}` });
+    }
+
+    // This query now joins with the profiles table to get the host's name
+    // ... inside app.get('/api/admin/vehicles/pending', ...)
+    const { data, error } = await supabase
+      .from('vehicles')
+      // UPDATED: Added certification_url and is_certified
+      .select(`*, certification_url, is_certified, profiles ( full_name )`)
+      .eq('status', 'pending');
+    //...
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET all vehicles that are approved
+app.get('/api/admin/vehicles/approved', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // 2. Fetch approved vehicles from the database
+    const { data, error } = await supabase
+      .from('vehicles')
+      .select('*')
+      .eq('status', 'approved');
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET all vehicles that are rejected
+app.get('/api/admin/vehicles/rejected', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // 2. Fetch rejected vehicles from the database
+    const { data, error } = await supabase
+      .from('vehicles')
+      .select('*')
+      .eq('status', 'rejected');
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Approve or Reject a vehicle
+app.patch('/api/admin/vehicles/:id/status', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+    const { status } = req.body;
+
+    // 2. Validate the new status
+    if (status !== 'approved' && status !== 'rejected') {
+      return res.status(400).json({ error: "Invalid status. Must be 'approved' or 'rejected'." });
+    }
+
+    // 3. Update the vehicle's status in the database
+    const { data, error } = await supabase
+      .from('vehicles')
+      .update({ status: status })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Vehicle not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET a list of all bookings
+app.get('/api/admin/bookings', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // 2. Fetch all bookings with user and vehicle details
+    const { data, error } = await supabase
+      .from('bookings')
+      .select(`
+        *,
+        profiles ( full_name ),
+        vehicles ( make, model, license_plate )
+      `);
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE any review (for moderation)
+app.delete('/api/admin/reviews/:id', authenticateToken, async (req, res) => {
+  try {
+    // 1. Security: Check if the user is an admin
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+
+    // 2. Delete the specified review from the database
+    const { data, error } = await supabase
+      .from('reviews')
+      .delete()
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Review not found.' });
+
+    res.status(204).send(); // Success, no content to return
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ... at the end of the ADMIN ENDPOINTS section in backend/index.js
+
+// NEW: GET all hosts that have submitted a document but are not yet verified
+app.get('/api/admin/hosts/pending', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('role', 'host')
+      .or('is_verified.eq.false,is_verified.is.null')
+      .not('business_document_url', 'is', null); // Only get hosts who have uploaded something
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: UPDATE a host's profile to set is_verified to true
+app.patch('/api/admin/hosts/:id/verify', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ is_verified: true })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Host not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: REJECT a host's verification (clears the document URL)
+app.patch('/api/admin/hosts/:id/reject', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({
+        is_verified: false,
+        business_document_url: null // Clear the document so it disappears from the queue
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Host not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ... at the end of the ADMIN ENDPOINTS section
+
+// NEW: Generate a temporary, secure URL for an admin to view a private document
+app.get('/api/admin/hosts/:hostId/document-url', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const { hostId } = req.params;
+
+    // First, get the file path from the host's profile
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('business_document_url')
+      .eq('id', hostId)
+      .single();
+
+    if (profileError || !profile || !profile.business_document_url) {
+      return res.status(404).json({ error: 'Document URL not found for this host.' });
+    }
+
+    // Extract the file path from the full URL
+    // Extract the file path from the full URL
+    // Robust extraction: get everything after 'host-documents/'
+    const urlParts = profile.business_document_url.split('/host-documents/');
+    if (urlParts.length < 2) {
+      // If standard split fails, maybe it IS just the filename or different structure (e.g. public URL vs internal)
+      // Let's assume the stored value might actually just be the filename in some iterations, OR full URL.
+      // Fallback: try to just use the end of the string.
+      console.log('Warning: Unexpected URL structure:', profile.business_document_url);
+      return res.status(400).json({ error: 'Invalid document path structure.' });
+    }
+    const filePath = decodeURIComponent(urlParts[1]); // Ensure proper decoding of spaces/special chars
+
+    // Create a signed URL that is valid for 5 minutes (300 seconds)
+    const { data, error: urlError } = await supabase.storage
+      .from('host-documents')
+      .createSignedUrl(filePath, 300);
+
+    if (urlError) throw urlError;
+
+    res.status(200).json({ signedUrl: data.signedUrl });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: Generate a temporary, secure URL for a vehicle certification
+app.get('/api/admin/vehicles/:vehicleId/certification-url', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const { vehicleId } = req.params;
+
+    const { data: vehicle, error: vehicleError } = await supabase
+      .from('vehicles')
+      .select('certification_url')
+      .eq('id', vehicleId)
+      .single();
+
+    if (vehicleError || !vehicle || !vehicle.certification_url) {
+      return res.status(404).json({ error: 'Certification document not found for this vehicle.' });
+    }
+
+    const filePath = new URL(vehicle.certification_url).pathname.split('/vehicle-certifications/')[1];
+
+    // Create a signed URL valid for 5 minutes
+    const { data, error: urlError } = await supabase.storage
+      .from('vehicle-certifications')
+      .createSignedUrl(filePath, 300);
+
+    if (urlError) throw urlError;
+
+    res.status(200).json({ signedUrl: data.signedUrl });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: Mark a vehicle as certified
+app.patch('/api/admin/vehicles/:id/certify', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('vehicles')
+      .update({ is_certified: true })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Vehicle not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET secure URL for a vehicle document (RC or Insurance)
+app.get('/api/admin/vehicles/:vehicleId/document-url', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { vehicleId } = req.params;
+    const { type } = req.query; // Expecting ?type=rc or ?type=insurance
+
+    if (!type || (type !== 'rc' && type !== 'insurance')) {
+      return res.status(400).json({ error: 'A document type of "rc" or "insurance" is required.' });
+    }
+
+    const documentColumn = type === 'rc' ? 'rc_document_url' : 'insurance_document_url';
+
+    const { data: vehicle, error: vehicleError } = await supabase
+      .from('vehicles')
+      .select(documentColumn)
+      .eq('id', vehicleId)
+      .single();
+
+    if (vehicleError || !vehicle || !vehicle[documentColumn]) {
+      return res.status(404).json({ error: `${type.toUpperCase()} document not found for this vehicle.` });
+    }
+
+    const filePath = new URL(vehicle[documentColumn]).pathname.split('/vehicle-certifications/')[1];
+
+    const { data, error } = await supabase.storage
+      .from('vehicle-certifications')
+      .createSignedUrl(filePath, 300); // Valid for 5 minutes
+
+    if (error) throw error;
+    res.status(200).json({ signedUrl: data.signedUrl });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: GET all tourists that have submitted a license but are not yet verified
+app.get('/api/admin/tourists/pending-license', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      // Removed strict role check so Hosts can also be verified for licenses
+      .or('is_license_verified.eq.false,is_license_verified.is.null')
+      .not('license_document_url', 'is', null); // Only get users who have uploaded a license
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: UPDATE a tourist's profile to set is_license_verified to true
+app.patch('/api/admin/tourists/:id/verify-license', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ is_license_verified: true })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Tourist not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: REJECT a tourist's license (clears the document URL)
+app.patch('/api/admin/tourists/:id/reject-license', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({
+        is_license_verified: false,
+        license_document_url: null // Clear the document so it disappears from the queue
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Tourist not found.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// NEW: Generate a temporary, secure URL for an admin to view a tourist's license
+app.get('/api/admin/tourists/:touristId/license-url', authenticateToken, async (req, res) => {
+  try {
+    if (!await checkAdmin(req)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const { touristId } = req.params;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('license_document_url')
+      .eq('id', touristId)
+      .single();
+
+    if (profileError || !profile || !profile.license_document_url) {
+      return res.status(404).json({ error: 'License document not found for this tourist.' });
+    }
+
+    const filePath = new URL(profile.license_document_url).pathname.split('/tourist-licenses/')[1];
+
+    const { data, error: urlError } = await supabase.storage
+      .from('tourist-licenses')
+      .createSignedUrl(filePath, 300); // URL is valid for 5 minutes
+
+    if (urlError) throw urlError;
+
+    res.status(200).json({ signedUrl: data.signedUrl });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ======== HOST ENDPOINTS (Protected) ========
+
+// backend/index.js
+
+// GET all vehicles for the currently logged-in host
+app.get('/api/hosts/my-vehicles', authenticateToken, async (req, res) => {
+  try {
+    let role = req.user?.user_metadata?.role;
+    const hostId = req.user?.sub || req.user?.id;
+    if (role !== 'host') {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', hostId)
+        .single();
+      if (prof?.role) role = prof.role;
+    }
+    if (role !== 'host') {
+      return res.status(403).json({ error: 'Access denied. Host role required.' });
+    }
+
+    const { data, error } = await supabase
+      .from('vehicles')
+      .select('*')
+      .eq('host_id', hostId);
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET all bookings made on a host's vehicles
+app.get('/api/hosts/my-bookings', authenticateToken, async (req, res) => {
+  try {
+    let role = req.user?.user_metadata?.role;
+    const hostId = req.user?.sub || req.user?.id;
+    if (role !== 'host') {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', hostId)
+        .single();
+      if (prof?.role) role = prof.role;
+    }
+    if (role !== 'host') {
+      return res.status(403).json({ error: 'Access denied. Host role required.' });
+    }
+
+    // Step 1: Find all vehicles that belong to the current host
+    const { data: hostVehicles, error: vehiclesError } = await supabase
+      .from('vehicles')
+      .select('id')
+      .eq('host_id', hostId);
+
+    if (vehiclesError) throw vehiclesError;
+
+    if (!hostVehicles || hostVehicles.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const vehicleIds = hostVehicles.map(v => v.id);
+
+    // Step 2: Find all bookings that match the host's vehicle IDs
+    const { data: bookings, error: bookingsError } = await supabase
+      .from('bookings')
+      .select(`
+                *,
+                vehicles ( make, model, vehicle_type, image_urls, fuel_type, transmission ),
+                profiles ( full_name )
+            `)
+      .in('vehicle_id', vehicleIds)
+      .order('created_at', { ascending: false }); // <-- ADD THIS LINE to sort
+
+    if (bookingsError) throw bookingsError;
+
+    res.status(200).json(bookings);
+
+  } catch (error) {
+    console.error('Error fetching host bookings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+//
+//
+// NEW: A more robust endpoint to get specific vehicle documents for a host
+app.get('/api/hosts/my-vehicles/:vehicleId/certification-url', authenticateToken, async (req, res) => {
+  try {
+    // 1. Role check is good, but can be combined with the vehicle ownership check.
+    const { vehicleId } = req.params;
+    const hostId = req.user.sub;
+
+    // 2. GET THE DOCUMENT TYPE FROM THE QUERY STRING
+    const { type } = req.query; // This is the new line that reads "?type=rc" or "?type=insurance"
+
+    // 3. VALIDATE THE TYPE
+    if (!type || (type !== 'rc' && type !== 'insurance')) {
+      return res.status(400).json({ error: 'A valid document type query parameter (?type=rc or ?type=insurance) is required.' });
+    }
+
+    // 4. CHOOSE THE CORRECT DATABASE COLUMN TO READ
+    const documentColumn = type === 'rc' ? 'rc_document_url' : 'insurance_document_url';
+
+    // 5. SECURITY CHECK & DYNAMICALLY SELECT THE CORRECT COLUMN
+    const { data: vehicle, error: vehicleError } = await supabase
+      .from('vehicles')
+      .select(`${documentColumn}, host_id`) // <-- CHANGED: Selects the correct column dynamically
+      .eq('id', vehicleId)
+      .eq('host_id', hostId) // <-- CHANGED: More efficient security check
+      .single();
+
+    if (vehicleError || !vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found or you do not have permission.' });
+    }
+
+    // 6. GET THE URL FROM THE CORRECT PROPERTY
+    const documentUrl = vehicle[documentColumn]; // <-- CHANGED: Accesses the correct property
+
+    if (!documentUrl) {
+      return res.status(404).json({ error: 'Document not found for this vehicle.' });
+    }
+
+    // 7. Generate the signed URL (this part is the same and correct)
+    const filePath = new URL(documentUrl).pathname.split('/vehicle-certifications/')[1];
+    const { data, error: urlError } = await supabase.storage
+      .from('vehicle-certifications')
+      .createSignedUrl(filePath, 300);
+
+    if (urlError) throw urlError;
+
+    res.status(200).json({ signedUrl: data.signedUrl });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: GET confirm bookings for a specific vehicle (for availability check)
+app.get('/api/vehicles/:vehicleId/bookings', async (req, res) => {
+  try {
+    const { vehicleId } = req.params;
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('start_date, end_date')
+      .eq('vehicle_id', vehicleId)
+      .eq('status', 'confirmed'); // Only fetch confirmed bookings
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ======== REVIEW ENDPOINTS (Protected) ========
+
+// CREATE a new review
+app.post('/api/reviews', authenticateToken, async (req, res) => {
+  try {
+    const { booking_id, vehicle_id, rating, comment } = req.body;
+    if (!booking_id || !rating || !vehicle_id) {
+      return res.status(400).json({ error: 'Booking ID, vehicle ID, and rating are required.' });
+    }
+
+    // In a real app, you would add logic here to verify that the user
+    // actually completed this booking before allowing a review.
+    // For now, we'll keep it simple.
+
+    const { data, error } = await supabase
+      .from('reviews')
+      .insert([{
+        user_id: req.user.sub,
+        booking_id,
+        vehicle_id,
+        rating,
+        comment
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// UPDATE a review
+app.put('/api/reviews/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rating, comment } = req.body;
+    const { data, error } = await supabase
+      .from('reviews')
+      .update({ rating, comment })
+      .eq('id', id)
+      .eq('user_id', req.user.sub) // Security: Ensures only the owner can update
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Review not found or you do not have permission to edit it.' });
+
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE a review
+app.delete('/api/reviews/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('reviews')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', req.user.sub) // Security: Ensures only the owner can delete
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Review not found or you do not have permission to delete it.' });
+
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Server Start ---
+const PORT = 3001;
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});

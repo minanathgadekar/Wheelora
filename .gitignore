@@ -1,0 +1,31 @@
+# General / OS specific
+.DS_Store
+*.log
+npm-debug.log*
+
+# Dependencies
+# This rule will ignore node_modules in BOTH frontend/ and backend/
+node_modules/
+
+# Build Output / Bundler Caches
+# This will ignore the build folder (dist) in the frontend
+dist
+dist-ssr
+.cache
+.parcel-cache
+.svelte-kit/
+
+# Environment Variables
+# This will ignore all .env files in BOTH frontend/ and backend/
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/
+!.vscode/extensions.json
+.idea/
+
+./invoices
+*.pdf
+.vite/
